@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
-  "name": "asio-nntp",
+  "name": "asio-http-websocket",
   "version": "1.0.0",
   "dependencies": [
     {
@@ -8,10 +8,6 @@
       "features": [ "ssl" ]
     },
     "boost-beast",
-    "gtest",
-    {
-      "name": "pdcurses",
-      "platform": "windows"
-    }
+    "rapidjson"
   ]
 }
