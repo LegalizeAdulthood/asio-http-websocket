@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "asio-nntp",
+  "version": "1.0.0",
+  "dependencies": [
+    {
+      "name": "boost-asio",
+      "features": [ "ssl" ]
+    },
+    "boost-beast",
+    "gtest",
+    {
+      "name": "pdcurses",
+      "platform": "windows"
+    }
+  ]
+}
