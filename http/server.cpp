@@ -11,9 +11,17 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "../common/server_certificate.hpp"
+
+#include <comicsdb.h>
+#include <json.h>
+
+namespace ComicsDb = comicsdb::v2;
 
 namespace beast = boost::beast;         // from <boost/beast.hpp>
 namespace http = beast::http;           // from <boost/beast/http.hpp>
@@ -24,67 +32,99 @@ using tcp = boost::asio::ip::tcp;       // from <boost/asio/ip/tcp.hpp>
 namespace comicServer
 {
 
-// Return a reasonable mime type based on the extension of a file.
-beast::string_view
-mime_type(beast::string_view path)
+struct State
 {
-    using beast::iequals;
-    auto const ext = [&path]
+    ComicsDb::ComicDb &db;
+    net::io_context   &ioc;
+    ssl::context      &ctx;
+};
+
+template <class Body, class Allocator>
+using Request = http::request<Body, http::basic_fields<Allocator>>;
+using Response = http::response<http::string_body>;
+
+// Returns a bad request response
+template <class Body, class Allocator>
+Response bad_request(const Request<Body, Allocator> &req, beast::string_view why)
+{
+    Response res{http::status::bad_request, req.version()};
+    res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    res.set(http::field::content_type, "text/html");
+    res.keep_alive(req.keep_alive());
+    res.body() = std::string(why);
+    res.prepare_payload();
+    return res;
+};
+
+// Returns a not found response
+template <class Body, class Allocator>
+Response not_found(const Request<Body, Allocator> &req, beast::string_view target)
+{
+    Response res{http::status::not_found, req.version()};
+    res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    res.set(http::field::content_type, "text/html");
+    res.keep_alive(req.keep_alive());
+    res.body() = "The resource '" + std::string(target) + "' was not found.";
+    res.prepare_payload();
+    return res;
+};
+
+    // Returns a server error response
+template <class Body, class Allocator>
+Response server_error(const Request<Body, Allocator> &req, beast::string_view what)
+{
+    Response res{http::status::internal_server_error, req.version()};
+    res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    res.set(http::field::content_type, "text/html");
+    res.keep_alive(req.keep_alive());
+    res.body() = "An error occurred: '" + std::string(what) + "'";
+    res.prepare_payload();
+    return res;
+};
+
+template <class Body, class Allocator>
+http::message_generator handle_get(ComicsDb::ComicDb &db, Request<Body, Allocator> &&req)
+{    
+    // Request path must match /comic/{:id}
+    if( !std::regex_match(std::string{req.target()}, std::regex{"^/comic/[0-9]+$"}))
+        return bad_request(req, "Illegal request-target " + std::string{req.target()});
+
+    // Respond to GET request
+    try
     {
-        auto const pos = path.rfind(".");
-        if(pos == beast::string_view::npos)
-            return beast::string_view{};
-        return path.substr(pos);
-    }();
-    if(iequals(ext, ".htm"))  return "text/html";
-    if(iequals(ext, ".html")) return "text/html";
-    if(iequals(ext, ".php"))  return "text/html";
-    if(iequals(ext, ".css"))  return "text/css";
-    if(iequals(ext, ".txt"))  return "text/plain";
-    if(iequals(ext, ".js"))   return "application/javascript";
-    if(iequals(ext, ".json")) return "application/json";
-    if(iequals(ext, ".xml"))  return "application/xml";
-    if(iequals(ext, ".swf"))  return "application/x-shockwave-flash";
-    if(iequals(ext, ".flv"))  return "video/x-flv";
-    if(iequals(ext, ".png"))  return "image/png";
-    if(iequals(ext, ".jpe"))  return "image/jpeg";
-    if(iequals(ext, ".jpeg")) return "image/jpeg";
-    if(iequals(ext, ".jpg"))  return "image/jpeg";
-    if(iequals(ext, ".gif"))  return "image/gif";
-    if(iequals(ext, ".bmp"))  return "image/bmp";
-    if(iequals(ext, ".ico"))  return "image/vnd.microsoft.icon";
-    if(iequals(ext, ".tiff")) return "image/tiff";
-    if(iequals(ext, ".tif"))  return "image/tiff";
-    if(iequals(ext, ".svg"))  return "image/svg+xml";
-    if(iequals(ext, ".svgz")) return "image/svg+xml";
-    return "application/text";
+        const auto      slash = req.target().find_last_of('/');
+        const int       id = std::atoi(std::string{req.target().substr(slash + 1)}.c_str());
+        ComicsDb::Comic comic = readComic(db, id);
+        Response        res{http::status::ok, req.version()};
+        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+        res.set(http::field::content_type, "application/json");
+        res.keep_alive(req.keep_alive());
+        res.body() = toJson(comic);
+        res.prepare_payload();
+        return res;
+    }
+    catch (const std::exception &bang)
+    {
+        return server_error(req, bang.what());
+    }
 }
 
-// Append an HTTP rel-path to a local filesystem path.
-// The returned path is normalized for the platform.
-std::string
-path_cat(
-    beast::string_view base,
-    beast::string_view path)
-{
-    if(base.empty())
-        return std::string(path);
-    std::string result(base);
-#ifdef BOOST_MSVC
-    char constexpr path_separator = '\\';
-    if(result.back() == path_separator)
-        result.resize(result.size() - 1);
-    result.append(path.data(), path.size());
-    for(auto& c : result)
-        if(c == '/')
-            c = path_separator;
-#else
-    char constexpr path_separator = '/';
-    if(result.back() == path_separator)
-        result.resize(result.size() - 1);
-    result.append(path.data(), path.size());
-#endif
-    return result;
+template <class Body, class Allocator>
+http::message_generator handle_put(ComicsDb::ComicDb &db, Request<Body, Allocator> &&req)
+{    
+    return bad_request(req, "Not implemented");
+}
+
+template <class Body, class Allocator>
+http::message_generator handle_delete(ComicsDb::ComicDb &db, Request<Body, Allocator> &&req)
+{    
+    return bad_request(req, "Not implemented");
+}
+
+template <class Body, class Allocator>
+http::message_generator handle_post(ComicsDb::ComicDb &db, Request<Body, Allocator> &&req)
+{    
+    return bad_request(req, "Not implemented");
 }
 
 // Return a response for the given request.
@@ -92,102 +132,27 @@ path_cat(
 // The concrete type of the response message (which depends on the
 // request), is type-erased in message_generator.
 template <class Body, class Allocator>
-http::message_generator
-handle_request(
-    http::request<Body, http::basic_fields<Allocator>>&& req)
+http::message_generator handle_request(ComicsDb::ComicDb &db, Request<Body, Allocator> &&req)
 {
-    // Returns a bad request response
-    auto const bad_request =
-    [&req](beast::string_view why)
-    {
-        http::response<http::string_body> res{http::status::bad_request, req.version()};
-        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-        res.set(http::field::content_type, "text/html");
-        res.keep_alive(req.keep_alive());
-        res.body() = std::string(why);
-        res.prepare_payload();
-        return res;
-    };
-
-    // Returns a not found response
-    auto const not_found =
-    [&req](beast::string_view target)
-    {
-        http::response<http::string_body> res{http::status::not_found, req.version()};
-        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-        res.set(http::field::content_type, "text/html");
-        res.keep_alive(req.keep_alive());
-        res.body() = "The resource '" + std::string(target) + "' was not found.";
-        res.prepare_payload();
-        return res;
-    };
-
-    // Returns a server error response
-    auto const server_error =
-    [&req](beast::string_view what)
-    {
-        http::response<http::string_body> res{http::status::internal_server_error, req.version()};
-        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-        res.set(http::field::content_type, "text/html");
-        res.keep_alive(req.keep_alive());
-        res.body() = "An error occurred: '" + std::string(what) + "'";
-        res.prepare_payload();
-        return res;
-    };
-
     // Make sure we can handle the method
-    if( req.method() != http::verb::get &&
-        req.method() != http::verb::head)
-        return bad_request("Unknown HTTP-method");
-
-    // Request path must be absolute and not contain "..".
-    if( req.target().empty() ||
-        req.target()[0] != '/' ||
-        req.target().find("..") != beast::string_view::npos)
-        return bad_request("Illegal request-target");
-
-    // Build the path to the requested file
-    std::string path = path_cat("/", req.target());
-    if(req.target().back() == '/')
-        path.append("index.html");
-
-    // Attempt to open the file
-    beast::error_code ec;
-    http::file_body::value_type body;
-    body.open(path.c_str(), beast::file_mode::scan, ec);
-
-    // Handle the case where the file doesn't exist
-    if(ec == beast::errc::no_such_file_or_directory)
-        return not_found(req.target());
-
-    // Handle an unknown error
-    if(ec)
-        return server_error(ec.message());
-
-    // Cache the size since we need it after the move
-    auto const size = body.size();
-
-    // Respond to HEAD request
-    if(req.method() == http::verb::head)
+    switch (req.method())
     {
-        http::response<http::empty_body> res{http::status::ok, req.version()};
-        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-        res.set(http::field::content_type, mime_type(path));
-        res.content_length(size);
-        res.keep_alive(req.keep_alive());
-        return res;
-    }
+    case http::verb::get:
+        return handle_get(db, std::move(req));
 
-    // Respond to GET request
-    http::response<http::file_body> res{
-        std::piecewise_construct,
-        std::make_tuple(std::move(body)),
-        std::make_tuple(http::status::ok, req.version())};
-    res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-    res.set(http::field::content_type, mime_type(path));
-    res.content_length(size);
-    res.keep_alive(req.keep_alive());
-    return res;
+    case http::verb::put:
+        return handle_put(db, std::move(req));
+
+    case http::verb::delete_:
+        return handle_delete(db, std::move(req));
+
+    case http::verb::post:
+        return handle_post(db, std::move(req));
+
+    default:
+        break;
+    }
+    return bad_request(req, "Unknown HTTP verb");
 }
 
 // Report a failure
@@ -220,17 +185,11 @@ fail(beast::error_code ec, char const* what)
 // Handles an HTTP server connection
 class session : public std::enable_shared_from_this<session>
 {
-    beast::ssl_stream<beast::tcp_stream> stream_;
-    beast::flat_buffer buffer_;
-    http::request<http::string_body> req_;
-
 public:
     // Take ownership of the socket
-    explicit
-    session(
-        tcp::socket&& socket,
-        ssl::context& ctx)
-        : stream_(std::move(socket), ctx)
+    explicit session(State &state, tcp::socket &&socket) :
+        state_(state),
+        stream_(std::move(socket), state.ctx)
     {
     }
 
@@ -305,8 +264,7 @@ public:
             return fail(ec, "read");
 
         // Send the response
-        send_response(
-            handle_request(std::move(req_)));
+        send_response(handle_request(state_.db, std::move(req_)));
     }
 
     void
@@ -367,23 +325,21 @@ public:
 
         // At this point the connection is closed gracefully
     }
+
+private:
+    State                               &state_;
+    beast::ssl_stream<beast::tcp_stream> stream_;
+    beast::flat_buffer                   buffer_;
+    http::request<http::string_body>     req_;
 };
 
 // Accepts incoming connections and launches the sessions
 class listener : public std::enable_shared_from_this<listener>
 {
-    net::io_context& ioc_;
-    ssl::context& ctx_;
-    tcp::acceptor acceptor_;
-
 public:
-    listener(
-        net::io_context& ioc,
-        ssl::context& ctx,
-        tcp::endpoint endpoint)
-        : ioc_(ioc)
-        , ctx_(ctx)
-        , acceptor_(ioc)
+    listener(State &state, tcp::endpoint endpoint) :
+        state_(state),
+        acceptor_(make_strand(state.ioc))
     {
         beast::error_code ec;
 
@@ -434,7 +390,7 @@ private:
     {
         // The new connection gets its own strand
         acceptor_.async_accept(
-            net::make_strand(ioc_),
+            net::make_strand(state_.ioc),
             beast::bind_front_handler(
                 &listener::on_accept,
                 shared_from_this()));
@@ -451,27 +407,31 @@ private:
         else
         {
             // Create the session and run it
-            std::make_shared<session>(
-                std::move(socket),
-                ctx_)->run();
+            std::make_shared<session>(state_, std::move(socket))->run();
         }
 
         // Accept another connection
         do_accept();
     }
+
+    State        &state_;
+    tcp::acceptor acceptor_;
 };
+
 int run(const char *addressText, unsigned short port, int numThreads)
 {
+    ComicsDb::ComicDb db = ComicsDb::load();
+
     const net::ip::address address = net::ip::make_address(addressText);
     net::io_context ioc(numThreads);
-    ssl::context ctx{ssl::context::tlsv12};
-    //load_server_certificate(ctx);
+    ssl::context ctx{ssl::context::tlsv12_server};
+    load_server_certificate(ctx);
+
+    // Server state: database, asio I/O context, SSL context
+    State state{db, ioc, ctx};
 
     // Create and launch a listening port
-    std::make_shared<listener>(
-        ioc,
-        ctx,
-        tcp::endpoint{address, port})->run();
+    std::make_shared<listener>(state, tcp::endpoint{address, port})->run();
 
     // Run the I/O service on the requested number of threads
     std::vector<std::thread> v;
