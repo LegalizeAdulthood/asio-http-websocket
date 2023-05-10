@@ -368,6 +368,7 @@ public:
         }
 
         // Start listening for connections
+        std::cout << "Listening for connections on endpoint " << endpoint << '\n';
         acceptor_.listen(
             net::socket_base::max_listen_connections, ec);
         if(ec)
