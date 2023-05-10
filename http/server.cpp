@@ -198,54 +198,18 @@ fail(beast::error_code ec, char const* what)
     std::cerr << what << ": " << ec.message() << "\n";
 }
 
-// Handles an HTTP server connection
-class session : public std::enable_shared_from_this<session>
+// Handles an HTTP server connection.
+// This uses the Curiously Recurring Template Pattern so that
+// the same code works with both SSL streams and regular sockets.
+template <class Derived>
+class session
 {
 public:
-    // Take ownership of the socket
-    explicit session(State &state, tcp::socket &&socket) :
-        state_(state),
-        stream_(std::move(socket), state.ctx)
+    // Take ownership of the buffer
+    session(State &state, beast::flat_buffer buffer) :
+        buffer_(std::move(buffer)),
+        state_(state)
     {
-    }
-
-    // Start the asynchronous operation
-    void
-    run()
-    {
-        // We need to be executing within a strand to perform async operations
-        // on the I/O objects in this session. Although not strictly necessary
-        // for single-threaded contexts, this example code is written to be
-        // thread-safe by default.
-        net::dispatch(
-            stream_.get_executor(),
-            beast::bind_front_handler(
-                &session::on_run,
-                shared_from_this()));
-    }
-
-    void
-    on_run()
-    {
-        // Set the timeout.
-        beast::get_lowest_layer(stream_).expires_after(
-            std::chrono::seconds(30));
-
-        // Perform the SSL handshake
-        stream_.async_handshake(
-            ssl::stream_base::server,
-            beast::bind_front_handler(
-                &session::on_handshake,
-                shared_from_this()));
-    }
-
-    void
-    on_handshake(beast::error_code ec)
-    {
-        if(ec)
-            return fail(ec, "handshake");
-
-        do_read();
     }
 
     void
@@ -256,13 +220,13 @@ public:
         req_ = {};
 
         // Set the timeout.
-        beast::get_lowest_layer(stream_).expires_after(std::chrono::seconds(30));
+        beast::get_lowest_layer(derived().stream()).expires_after(std::chrono::seconds(30));
 
         // Read a request
-        http::async_read(stream_, buffer_, req_,
+        http::async_read(derived().stream(), buffer_, req_,
             beast::bind_front_handler(
                 &session::on_read,
-                shared_from_this()));
+                derived().shared_from_this()));
     }
 
     void
@@ -274,7 +238,7 @@ public:
 
         // This means they closed the connection
         if(ec == http::error::end_of_stream)
-            return do_close();
+            return derived().do_eof();
 
         if(ec)
             return fail(ec, "read");
@@ -290,11 +254,11 @@ public:
 
         // Write the response
         beast::async_write(
-            stream_,
+            derived().stream(),
             std::move(msg),
             beast::bind_front_handler(
                 &session::on_write,
-                this->shared_from_this(),
+                derived().shared_from_this(),
                 keep_alive));
     }
 
@@ -313,15 +277,133 @@ public:
         {
             // This means we should close the connection, usually because
             // the response indicated the "Connection: close" semantic.
-            return do_close();
+            return derived().do_eof();
         }
 
         // Read another request
         do_read();
     }
 
+protected:
+    beast::flat_buffer buffer_;
+
+private:
+    Derived &derived()
+    {
+        return static_cast<Derived &>(*this);
+    }
+
+    State                               &state_;
+    http::request<http::string_body>     req_;
+};
+
+// Handles a plain HTTP connection
+class plain_session
+    : public session<plain_session>
+    , public std::enable_shared_from_this<plain_session>
+{
+public:
+    // Create the session
+    plain_session(State &state, tcp::socket &&socket, beast::flat_buffer buffer) :
+        session<plain_session>(state, std::move(buffer)),
+        stream_(std::move(socket))
+    {
+    }
+
+    // Called by the base class
+    beast::tcp_stream&
+    stream()
+    {
+        return stream_;
+    }
+
+    // Start the asynchronous operation
     void
-    do_close()
+    run()
+    {
+        // We need to be executing within a strand to perform async operations
+        // on the I/O objects in this session. Although not strictly necessary
+        // for single-threaded contexts, this example code is written to be
+        // thread-safe by default.
+        net::dispatch(stream_.get_executor(),
+                      beast::bind_front_handler(
+                          &session::do_read,
+                          shared_from_this()));
+    }
+
+    void
+    do_eof()
+    {
+        // Send a TCP shutdown
+        beast::error_code ec;
+        stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+
+        // At this point the connection is closed gracefully
+    }
+
+private:
+    beast::tcp_stream stream_;
+};
+
+// Handles an SSL HTTP connection
+class ssl_session
+    : public session<ssl_session>
+    , public std::enable_shared_from_this<ssl_session>
+{
+public:
+    // Create the session
+    ssl_session(State &state, tcp::socket &&socket, beast::flat_buffer buffer) :
+        session<ssl_session>(state, std::move(buffer)),
+        stream_(std::move(socket), state.ctx)
+    {
+    }
+
+    // Called by the base class
+    beast::ssl_stream<beast::tcp_stream>&
+    stream()
+    {
+        return stream_;
+    }
+
+    // Start the asynchronous operation
+    void
+    run()
+    {
+        auto self = shared_from_this();
+        // We need to be executing within a strand to perform async operations
+        // on the I/O objects in this session.
+        net::dispatch(stream_.get_executor(), [self]() {
+            // Set the timeout.
+            beast::get_lowest_layer(self->stream_).expires_after(
+                std::chrono::seconds(30));
+
+            // Perform the SSL handshake
+            // Note, this is the buffered version of the handshake.
+            self->stream_.async_handshake(
+                ssl::stream_base::server,
+                self->buffer_.data(),
+                beast::bind_front_handler(
+                    &ssl_session::on_handshake,
+                    self));
+        });
+    }
+
+    void
+    on_handshake(
+        beast::error_code ec,
+        std::size_t bytes_used)
+    {
+        if(ec)
+            return fail(ec, "handshake");
+
+        // Consume the portion of the buffer used by the handshake
+        this->buffer_.consume(bytes_used);
+
+        this->do_read();
+    }
+
+    void
+    do_eof()
     {
         // Set the timeout.
         beast::get_lowest_layer(stream_).expires_after(std::chrono::seconds(30));
@@ -329,7 +411,7 @@ public:
         // Perform the SSL shutdown
         stream_.async_shutdown(
             beast::bind_front_handler(
-                &session::on_shutdown,
+                &ssl_session::on_shutdown,
                 shared_from_this()));
     }
 
@@ -343,10 +425,56 @@ public:
     }
 
 private:
-    State                               &state_;
     beast::ssl_stream<beast::tcp_stream> stream_;
-    beast::flat_buffer                   buffer_;
-    http::request<http::string_body>     req_;
+};
+
+// Detects SSL handshakes
+class detect_session : public std::enable_shared_from_this<detect_session>
+{
+public:
+    detect_session(State &state, tcp::socket &&socket) :
+        state_(state),
+        stream_(std::move(socket))
+    {
+    }
+
+    // Launch the detector
+    void
+    run()
+    {
+        // Set the timeout.
+        beast::get_lowest_layer(stream_).expires_after(std::chrono::seconds(30));
+
+        // Detect a TLS handshake
+        async_detect_ssl(
+            stream_,
+            buffer_,
+            beast::bind_front_handler(
+                &detect_session::on_detect,
+                shared_from_this()));
+    }
+
+    void
+    on_detect(beast::error_code ec, bool result)
+    {
+        if(ec)
+            return fail(ec, "detect");
+
+        if(result)
+        {
+            // Launch SSL session
+            std::make_shared<ssl_session>(state_, stream_.release_socket(), std::move(buffer_))->run();
+            return;
+        }
+
+        // Launch plain session
+        std::make_shared<plain_session>(state_, stream_.release_socket(), std::move(buffer_))->run();
+    }
+
+private:
+    State             &state_;
+    beast::tcp_stream  stream_;
+    beast::flat_buffer buffer_;
 };
 
 // Accepts incoming connections and launches the sessions
@@ -424,7 +552,7 @@ private:
         else
         {
             // Create the session and run it
-            std::make_shared<session>(state_, std::move(socket))->run();
+            std::make_shared<detect_session>(state_, std::move(socket))->run();
         }
 
         // Accept another connection
@@ -443,6 +571,7 @@ int run(const char *addressText, unsigned short port, int numThreads)
     net::io_context ioc(numThreads);
     ssl::context ctx{ssl::context::tlsv12_server};
     load_server_certificate(ctx);
+    ctx.set_default_verify_paths();
 
     // Server state: database, asio I/O context, SSL context
     State state{db, ioc, ctx};
